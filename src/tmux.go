@@ -12,7 +12,7 @@ import (
 
 // Returns the size of the current window if the tmux server supports
 // floating panes (tmux 3.7 or above)
-func tmuxFloatingPaneInfo() (int, int, bool) {
+func tmuxFloatingPaneInfo() (int, int, bool, bool) {
 	// TMUX_PANE is not set when fzf is not started from within a pane
 	// (e.g. 'bind-key 0 run-shell "fzf --popup"'). Do not use a floating
 	// pane there; a blocking run-shell suspends key processing for the
@@ -25,7 +25,7 @@ func tmuxFloatingPaneInfo() (int, int, bool) {
 	//   https://github.com/tmux/tmux/issues/5384
 	target := os.Getenv("TMUX_PANE")
 	if target == "" {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	// A single invocation for both checks. Cannot rely on the exit status;
 	// tmux versions before 3.7 exit normally with empty output for an
@@ -33,17 +33,19 @@ func tmuxFloatingPaneInfo() (int, int, bool) {
 	out, err := exec.Command("tmux", "display-message", "-p", "-t", target,
 		"#{window_width} #{window_height}", ";", "list-commands", "new-pane").Output()
 	if err != nil || !strings.Contains(string(out), "new-pane") {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	var width, height int
 	if _, err := fmt.Sscanf(string(out), "%d %d", &width, &height); err != nil {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	// The window is too small to fit a floating pane of the minimum size
 	if width < 3 || height < 3 {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
-	return width, height, true
+	fields := strings.Fields(string(out))
+	overZoom := len(fields) > 4 && fields[2] == "new-pane" && strings.Contains(fields[4], "A")
+	return width, height, overZoom, true
 }
 
 // tmux ends a command at an argument ending in ';', so a trailing one is
@@ -85,7 +87,7 @@ func tmuxDim(spec sizeSpec, window int) int {
 	return max(3, min(dim, window))
 }
 
-func runTmuxFloatingPane(argStr string, dir string, windowWidth int, windowHeight int, opts *Options) (int, error) {
+func runTmuxFloatingPane(argStr string, dir string, windowWidth int, windowHeight int, overZoom bool, opts *Options) (int, error) {
 	// Unlike display-popup, the size of a floating pane does not account for
 	// the border around it, and the position is that of the content area. To
 	// stay consistent with popups, treat the requested size as the total
@@ -166,15 +168,20 @@ func runTmuxFloatingPane(argStr string, dir string, windowWidth int, windowHeigh
 		}
 		paneCmd := fmt.Sprintf("%s%s %s; echo $? > %s; tmux wait-for -S %s",
 			setup, escapeSingleQuote(sh), escapeSingleQuote(temp), code, signal)
-		// Unzoom the window first; creating a floating pane over a zoomed
-		// window crashes the tmux server on 3.7b, and newer versions of
-		// tmux unzoom the window anyway.
+		// Older tmux versions need to unzoom first (3.7b can crash).
+		// When new-pane supports -A, keep the float above the zoomed pane.
 		target := os.Getenv("TMUX_PANE")
 		newPane := fmt.Sprintf(
 			"tmux if -F -t %s '#{window_zoomed_flag}' %s ';' new-pane -P -F '#{pane_id}' -t %s -c %s -x %d -y %d -X %d -Y %d %s -c %s",
 			escapeSingleQuote(target), escapeSingleQuote("resize-pane -Z -t "+target),
 			escapeSingleQuote(target), escapeSingleQuote(dir), width-2, height-2, x, y,
 			escapeSingleQuote(sh), escapeSingleQuote(paneCmd))
+		if overZoom {
+			newPane = fmt.Sprintf(
+				"tmux new-pane -A -P -F '#{pane_id}' -t %s -c %s -x %d -y %d -X %d -Y %d %s -c %s",
+				escapeSingleQuote(target), escapeSingleQuote(dir), width-2, height-2, x, y,
+				escapeSingleQuote(sh), escapeSingleQuote(paneCmd))
+		}
 
 		// The pane is killed when the proxy process is interrupted or hung up,
 		// like a popup dying with its client. wait-for runs in the background
@@ -222,10 +229,10 @@ func runTmux(args []string, opts *Options) (int, error) {
 	// popup is used instead so that the fzf-drawn border is the only border
 	// shown; the native border of a tmux floating pane cannot be removed.
 	if nativeBorder(opts) {
-		if windowWidth, windowHeight, ok := tmuxFloatingPaneInfo(); ok {
+		if windowWidth, windowHeight, overZoom, ok := tmuxFloatingPaneInfo(); ok {
 			opts.Tmux.border = true
 			argStr, dir := popupArgStr(args, opts)
-			return runTmuxFloatingPane(argStr, dir, windowWidth, windowHeight, opts)
+			return runTmuxFloatingPane(argStr, dir, windowWidth, windowHeight, overZoom, opts)
 		}
 	}
 
